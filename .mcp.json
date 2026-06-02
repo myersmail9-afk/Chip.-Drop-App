@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "jobber": {
+      "command": "/Users/josephmyers/Documents/ClaudeCowork-Setup/2-PROJECTS/Bid-scheduling/jobber-mcp/.venv/bin/python",
+      "args": [
+        "/Users/josephmyers/Documents/ClaudeCowork-Setup/2-PROJECTS/Bid-scheduling/jobber-mcp/jobber_mcp_server.py"
+      ]
+    }
+  }
+}

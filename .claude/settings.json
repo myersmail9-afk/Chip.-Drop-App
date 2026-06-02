@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__jobber__jobber_search_clients",
+      "mcp__jobber__jobber_get_client",
+      "mcp__jobber__jobber_list_requests",
+      "mcp__jobber__jobber_list_quotes",
+      "mcp__jobber__jobber_list_visits",
+      "mcp__jobber__jobber_get_request"
+    ]
+  }
+}

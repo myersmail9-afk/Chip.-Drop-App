@@ -13,6 +13,9 @@ Chip.-Drop-App/
 ├── manifest.json      ← PWA install manifest
 ├── sw.js              ← Service worker (bypasses cache for script.google.com)
 ├── icon-*.png         ← PWA icons
+├── .mcp.json          ← Launches Joseph's local Jobber MCP (dev-only, Mac-only path)
+├── .claude/settings.json ← Pre-approves read-only Jobber MCP tools
+├── JOBBER-MCP.md      ← What the Jobber MCP is + tool inventory (research, not runtime)
 ├── apps-script/       ← Google Apps Script backend (clasp-managed)
 │   ├── CLAUDE.md         ← edit/deploy workflow + invoice plan
 │   ├── README.md         ← clasp commands reference
