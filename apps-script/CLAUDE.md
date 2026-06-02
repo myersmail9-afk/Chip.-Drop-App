@@ -46,23 +46,41 @@ on a customer card, the PWA POSTs to this Apps Script's web app
 The PWA's service worker (`../sw.js`) explicitly bypasses caching for
 `script.google.com`, so every tap hits this backend live.
 
-## What's planned next (not built — discuss before building)
+## Jobber invoicing (built in v4 — needs creds + schema verify before live)
 
-Add automatic **Jobber invoicing** after the email send:
-- VIP / paid tier → $30/load invoice line item
-- Free tier → $0 line item (issued for record-keeping)
+Automatic **Jobber invoicing** fires in `handleDrop` after the email
+send, via `maybeCreateInvoice_`. Decisions locked in with Joseph:
 
-The Jobber client ID is already on the sheet. The new function needs
-`(clientId, tier, loadCount)` plus the existing sheet lookup.
+- **One invoice per +1 tap** (not a rolling per-job invoice). Two taps
+  → two invoices.
+- **Rate is read per-customer** from the priority column —
+  `customerRate_()` parses `$30`/`$50`/`$30.50`/etc. Free tier ($0).
+- **Free tier still gets a $0 invoice**, emailed like any other (record).
+- **Invoice goes to the customer; Joseph gets a copy** via
+  `notifyInvoice_` (MailApp, not Jobber CC — reliable).
 
-Jobber OAuth creds (client_id, client_secret, refresh_token) live in
-`PropertiesService.getScriptProperties()` — never in any committed
-file. Apps Script handles its own token refresh. The Jobber MCP is
-NOT in the runtime path (MCP is a Claude-only tool — your runtime is
-plain HTTPS to Jobber's GraphQL endpoint).
+Plumbing that's done and trustworthy: OAuth refresh + token caching
+(`getJobberAccessToken_`), GraphQL transport (`jobberGraphQL_`), and
+client-id encoding (`jobberEncodedClientId_` →
+`base64("gid://Jobber/Client/<id>")` from the sheet's Jobber URL).
 
-Open question for Joseph before code: **one invoice per +1 tap, or
-one invoice per chip-drop job that accumulates line items?**
+⚠ **Verify before deploy:** the exact `invoiceCreate` /
+`invoiceSendEmail` field names in `createJobberInvoice_` /
+`sendJobberInvoice_` were written without live schema access. Confirm
+them in GraphiQL (Developer Center → Test in GraphiQL → Documentation)
+or via the local Jobber MCP, then `./deploy-apps-script.sh`.
+
+Until creds are set, the invoice step **safely no-ops** (returns a skip
+reason) — drops still log and notify as before.
+
+**Setup (one-time):** add `JOBBER_CLIENT_ID`, `JOBBER_CLIENT_SECRET`,
+`JOBBER_REFRESH_TOKEN` in Project Settings → Script Properties. Run
+`checkJobberConfig_` to confirm they're present (logs set/MISSING, never
+the values). No new OAuth scopes were needed — `script.external_request`
+was already granted, so the live web app does NOT need re-authorizing.
+
+The Jobber MCP is NOT in the runtime path — runtime is plain HTTPS to
+Jobber's GraphQL endpoint from Apps Script.
 
 ## Hard rules when editing
 
