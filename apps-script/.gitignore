@@ -1,0 +1,15 @@
+# clasp credentials — never commit
+.clasprc.json
+clasp-credentials.json
+
+# Local secrets
+.env
+.env.local
+secrets.json
+
+# Node tooling
+node_modules/
+package-lock.json
+
+# macOS
+.DS_Store
