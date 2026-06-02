@@ -66,30 +66,33 @@ git add apps-script && git commit -m "..." && git push
 PWA hits — `clasp deploy` is what makes a new version live for the crew.
 The wrapper always does both.
 
-## What's planned next (do not build until Joseph confirms)
+## Jobber invoicing (built in v4 — needs creds + schema verify before live)
 
-Add automatic **Jobber invoicing** to the `drop` handler in `Code.js`,
-right after the email/SMS sends:
+Automatic **Jobber invoicing** is wired into the `drop` handler in
+`Code.js`, right after the email/SMS send (`maybeCreateInvoice_`).
 
-- VIP / paid tier → `$30/load` line item on a Jobber invoice
-- Free tier → `$0/load` line item (issued for record-keeping)
+Decisions locked in with Joseph (the two old open questions, resolved):
 
-The Jobber client ID is already on the Chip Drops Live (v2) sheet —
-the existing "Open Jobber" email button reads it from that column.
-The new function only needs `(clientId, tier, loadCount)` plus the
-existing sheet lookup.
+1. **One invoice per +1 tap** — two taps make two invoices.
+2. **Price is per-customer, read from the sheet's priority column**
+   (`customerRate_` parses `$30`/`$50`/`$30.50`). Not a flat rate.
 
-Jobber OAuth credentials (client_id, client_secret, refresh_token)
-go into `PropertiesService.getScriptProperties()` — never in any
-committed file. Apps Script handles its own OAuth refresh. The
-Jobber MCP is a Claude-only tool — it is NOT in the runtime path.
+Behavior: paid tier → invoice at the customer's per-load rate; free
+tier → a `$0` invoice (issued for record-keeping). Every invoice is
+sent to the customer, and Joseph gets a copy via `notifyInvoice_`.
 
-**Open questions before code is written:**
+The Jobber client ID is read from the sheet's Jobber URL column and
+encoded for GraphQL (`base64("gid://Jobber/Client/<id>")`). OAuth
+creds (`JOBBER_CLIENT_ID`, `JOBBER_CLIENT_SECRET`,
+`JOBBER_REFRESH_TOKEN`) go in Script Properties — never committed.
+No new OAuth scopes were needed (`script.external_request` already
+granted). The Jobber MCP is NOT in the runtime path.
 
-1. **One invoice per tap, or one rolling invoice per chip-drop job
-   that accumulates line items?**
-2. **Confirm price** — the email shows `$30/load`, Joseph mentioned
-   `$30.50` in chat. Which is right?
+⚠ **Before going live:** verify the exact `invoiceCreate` /
+`invoiceSendEmail` mutation field names in GraphiQL (or the local
+Jobber MCP), set the Script Properties, then `./deploy-apps-script.sh`.
+Until creds are set, the invoice step safely no-ops — drops keep working.
+See `apps-script/CLAUDE.md` for the full detail.
 
 ## Sister projects (do not confuse)
 

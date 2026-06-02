@@ -1,5 +1,18 @@
 /**
- * TTC Chip Drops — write endpoint v3
+ * TTC Chip Drops — write endpoint v4
+ *
+ * v4 adds:
+ *  - Auto-invoice via Jobber on every drop (handleDrop → maybeCreateInvoice_)
+ *    One invoice per +1 tap. Rate read per-customer from the priority column
+ *    ($30/$50/etc); free tier issues a $0 invoice. Invoice is sent to the
+ *    customer and a copy/confirmation emails Joseph.
+ *  - No new OAuth scopes: script.external_request was already granted.
+ *  - Jobber OAuth creds live in Script Properties, never in this file:
+ *    JOBBER_CLIENT_ID, JOBBER_CLIENT_SECRET, JOBBER_REFRESH_TOKEN.
+ *    Until those are set, the invoice step safely no-ops — drops still work.
+ *  ⚠ VERIFY before going live: the exact invoiceCreate / send mutation field
+ *    names in createJobberInvoice_ / sendJobberInvoice_ were written without
+ *    live schema access. Confirm them in Jobber GraphiQL, then clasp deploy.
  *
  * v3 adds:
  *  - Auto-flip Status → Inactive when loadsDelivered ≥ loadsWanted (drop)
@@ -47,6 +60,17 @@ const JOSEPH_SMS_GATEWAYS = [
 ];
 
 const TIME_ZONE = 'America/Denver';
+
+// === JOBBER INVOICING ===
+// OAuth creds are NEVER committed — set them in Script Properties:
+//   Project Settings → Script Properties → add JOBBER_CLIENT_ID,
+//   JOBBER_CLIENT_SECRET, JOBBER_REFRESH_TOKEN. Run checkJobberConfig_ to
+//   confirm they're present (it logs set/MISSING, never the values).
+const JOBBER_TOKEN_URL   = 'https://api.getjobber.com/api/oauth/token';
+const JOBBER_GRAPHQL_URL = 'https://api.getjobber.com/api/graphql';
+// X-JOBBER-GRAPHQL-VERSION is required on every request. Must be an active
+// version (date format) per Jobber's changelog — bump as versions retire.
+const JOBBER_API_VERSION = '2025-01-20';
 
 // === ENTRY POINTS ===
 
@@ -174,6 +198,17 @@ function handleDrop(data) {
     // Notify Joseph (email + SMS)
     notifyDrop_(customerName, loads, newLoads, street, city, tier, jobberUrl, mapsUrl);
 
+    // Auto-invoice via Jobber. One invoice per tap. No-ops (returns a skip
+    // reason) if creds aren't configured, so a Jobber outage never blocks a
+    // drop from being logged.
+    let invoice = null;
+    try {
+      invoice = maybeCreateInvoice_(customerName, loads, tier, jobberUrl, dropDate);
+    } catch (e) {
+      Logger.log('Invoice step threw: ' + e);
+      invoice = { ok: false, error: String(e) };
+    }
+
     return jsonResponse({
       ok: true,
       customer: customerName,
@@ -181,7 +216,8 @@ function handleDrop(data) {
       new_total: newLoads,
       last_drop_date: dropDate,
       log_row: logRow,
-      now_fulfilled: nowFulfilled
+      now_fulfilled: nowFulfilled,
+      invoice: invoice
     });
   } finally {
     lock.releaseLock();
@@ -353,6 +389,206 @@ function notifyUndo_(name, reversedLoads, newTotal) {
   }
 }
 
+// === JOBBER INVOICING ===
+
+// Parse the per-load rate from the priority/tier column text.
+// "$30" → 30, "$50" → 50, "$30.50" → 30.5, anything without a price → 0 (free).
+function customerRate_(tierRaw) {
+  const m = String(tierRaw || '').match(/\$\s*(\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : 0;
+}
+
+// The sheet stores a Jobber client URL like .../clients/12345678. Jobber's
+// GraphQL API references a client by an encoded global ID:
+// base64("gid://Jobber/Client/<numericId>"). Returns null if no id is found.
+function jobberEncodedClientId_(jobberUrl) {
+  const m = String(jobberUrl || '').match(/clients?\/(\d+)/i);
+  if (!m) return null;
+  return Utilities.base64Encode('gid://Jobber/Client/' + m[1]);
+}
+
+// Get a valid Jobber access token, refreshing via the stored refresh token.
+// Caches the access token in Script Properties until ~2 min before expiry.
+// Returns null (never throws) when creds are missing or the refresh fails —
+// callers treat null as "not configured / unavailable" and skip invoicing.
+// NEVER logs token values (hard rule).
+function getJobberAccessToken_() {
+  const props = PropertiesService.getScriptProperties();
+  const clientId     = props.getProperty('JOBBER_CLIENT_ID');
+  const clientSecret = props.getProperty('JOBBER_CLIENT_SECRET');
+  const refreshToken = props.getProperty('JOBBER_REFRESH_TOKEN');
+  if (!clientId || !clientSecret || !refreshToken) return null;
+
+  const cached    = props.getProperty('JOBBER_ACCESS_TOKEN');
+  const expiresAt = parseInt(props.getProperty('JOBBER_TOKEN_EXPIRES_AT') || '0', 10);
+  if (cached && Date.now() < expiresAt - 120000) return cached;
+
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch(JOBBER_TOKEN_URL, {
+      method: 'post',
+      muteHttpExceptions: true,
+      payload: {
+        grant_type: 'refresh_token',
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken
+      }
+    });
+  } catch (e) {
+    Logger.log('Jobber token request threw: ' + e);
+    return null;
+  }
+  if (resp.getResponseCode() >= 300) {
+    Logger.log('Jobber token refresh failed: HTTP ' + resp.getResponseCode());
+    return null;
+  }
+  const body = JSON.parse(resp.getContentText() || '{}');
+  if (!body.access_token) return null;
+  props.setProperty('JOBBER_ACCESS_TOKEN', body.access_token);
+  props.setProperty('JOBBER_TOKEN_EXPIRES_AT', String(Date.now() + (body.expires_in || 3600) * 1000));
+  // Jobber rotates refresh tokens — persist the new one so we don't get locked out.
+  if (body.refresh_token) props.setProperty('JOBBER_REFRESH_TOKEN', body.refresh_token);
+  return body.access_token;
+}
+
+// POST a GraphQL query/mutation to Jobber. Returns {ok, data, errors} or null
+// if no token is available. Never throws.
+function jobberGraphQL_(query, variables) {
+  const token = getJobberAccessToken_();
+  if (!token) return null;
+  let resp;
+  try {
+    resp = UrlFetchApp.fetch(JOBBER_GRAPHQL_URL, {
+      method: 'post',
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'X-JOBBER-GRAPHQL-VERSION': JOBBER_API_VERSION
+      },
+      payload: JSON.stringify({ query: query, variables: variables })
+    });
+  } catch (e) {
+    Logger.log('Jobber GraphQL request threw: ' + e);
+    return { ok: false, errors: [{ message: String(e) }] };
+  }
+  const code = resp.getResponseCode();
+  const json = JSON.parse(resp.getContentText() || '{}');
+  if (code >= 300 || (json.errors && json.errors.length)) {
+    Logger.log('Jobber GraphQL error (HTTP ' + code + '): ' + JSON.stringify(json.errors || {}));
+    return { ok: false, data: json.data, errors: json.errors };
+  }
+  return { ok: true, data: json.data };
+}
+
+// Orchestrates the invoice for one drop. Returns a small status object that
+// gets folded into the JSON response (handy for the PWA + debugging).
+function maybeCreateInvoice_(customerName, loads, tier, jobberUrl, dropDate) {
+  const props = PropertiesService.getScriptProperties();
+  if (!props.getProperty('JOBBER_REFRESH_TOKEN')) return { skipped: 'not_configured' };
+
+  const encodedClientId = jobberEncodedClientId_(jobberUrl);
+  if (!encodedClientId) return { skipped: 'no_jobber_client_id', jobber_url: jobberUrl };
+
+  const rate = customerRate_(tier);          // 0 for free tier — we still issue a $0 invoice
+  const result = createJobberInvoice_(encodedClientId, rate, loads, customerName, dropDate);
+  if (result && result.ok && result.invoice) {
+    // Email the customer the invoice (decision: customer gets it + copy to Joseph).
+    sendJobberInvoice_(result.invoice.id);
+    notifyInvoice_(customerName, loads, rate, result.invoice);   // Joseph's copy
+  }
+  return result;
+}
+
+// ⚠ SCHEMA-DEPENDENT — VERIFY IN JOBBER GRAPHiQL BEFORE GOING LIVE.
+// The transport above (OAuth refresh, token caching, GraphQL POST, client-id
+// encoding) is solid. The exact field names in this mutation were written
+// without live schema access. Open GraphiQL (Developer Center → Test in
+// GraphiQL → Documentation) or your local Jobber MCP, confirm the
+// invoiceCreate input shape (clientId, lineItems[].name/quantity/unitPrice,
+// subject), adjust below, then ./deploy-apps-script.sh.
+function createJobberInvoice_(encodedClientId, rate, loads, customerName, dropDate) {
+  const mutation = [
+    'mutation CreateInvoice($input: InvoiceCreateInput!) {',
+    '  invoiceCreate(input: $input) {',
+    '    invoice { id invoiceNumber subject }',
+    '    userErrors { message }',
+    '  }',
+    '}'
+  ].join('\n');
+
+  const variables = {
+    input: {
+      clientId: encodedClientId,
+      subject: 'Chip drop — ' + customerName + ' (' + dropDate + ')',
+      lineItems: [{
+        name: 'Wood chip load',
+        quantity: loads,
+        unitPrice: +rate.toFixed(2)   // $0 line item for free-tier, per spec
+      }]
+    }
+  };
+
+  const res = jobberGraphQL_(mutation, variables);
+  if (!res) return { skipped: 'no_token' };
+  if (!res.ok) return { ok: false, errors: res.errors };
+
+  const payload = res.data && res.data.invoiceCreate;
+  const userErrors = payload && payload.userErrors;
+  if (userErrors && userErrors.length) {
+    Logger.log('invoiceCreate userErrors: ' + JSON.stringify(userErrors));
+    return { ok: false, user_errors: userErrors };
+  }
+  return { ok: true, invoice: payload && payload.invoice };
+}
+
+// ⚠ SCHEMA-DEPENDENT — VERIFY IN JOBBER GRAPHiQL.
+// Emails the created invoice to the client. Some Jobber API versions expose
+// invoiceSendEmail / a send transition; confirm the exact mutation. If sending
+// isn't available via API on your plan, the invoice is still created in Jobber
+// and Joseph's copy email (notifyInvoice_) links to it for manual send.
+function sendJobberInvoice_(invoiceId) {
+  if (!invoiceId) return;
+  const mutation = [
+    'mutation SendInvoice($id: EncodedId!) {',
+    '  invoiceSendEmail(invoiceId: $id) {',
+    '    userErrors { message }',
+    '  }',
+    '}'
+  ].join('\n');
+  const res = jobberGraphQL_(mutation, { id: invoiceId });
+  if (res && !res.ok) Logger.log('sendJobberInvoice_ failed (verify mutation): ' + JSON.stringify(res.errors));
+}
+
+// Joseph's copy/confirmation that an invoice fired. Uses MailApp (reliable,
+// fully under our control) rather than relying on Jobber's CC.
+function notifyInvoice_(customerName, loads, rate, invoice) {
+  const loadsStr = (loads === 0.5) ? '½' : String(loads);
+  const total = (rate * loads).toFixed(2);
+  const num = invoice && (invoice.invoiceNumber || invoice.id) || '(pending)';
+  const subject = `🧾 Invoice ${num}: ${customerName} — $${total}`;
+  const body =
+    `${customerName}\n` +
+    `${loadsStr} load${loads === 1 ? '' : 's'} × $${rate.toFixed(2)} = $${total}\n` +
+    `Invoice: ${num}\n` +
+    (rate === 0 ? '(Free tier — $0 invoice issued for records)\n' : '') +
+    `\nJobber: https://secure.getjobber.com/`;
+  try { MailApp.sendEmail({ to: JOSEPH_EMAIL, subject, body }); } catch (e) {
+    Logger.log('notifyInvoice_ email failed: ' + e);
+  }
+}
+
+// Diagnostic — logs whether each Jobber cred is present. Never logs values.
+function checkJobberConfig_() {
+  const p = PropertiesService.getScriptProperties();
+  const state = k => p.getProperty(k) ? 'set' : 'MISSING';
+  Logger.log('JOBBER_CLIENT_ID: '     + state('JOBBER_CLIENT_ID'));
+  Logger.log('JOBBER_CLIENT_SECRET: ' + state('JOBBER_CLIENT_SECRET'));
+  Logger.log('JOBBER_REFRESH_TOKEN: ' + state('JOBBER_REFRESH_TOKEN'));
+  Logger.log('API version: ' + JOBBER_API_VERSION);
+}
+
 // === DAILY SUMMARY (8 PM trigger) ===
 
 function dailySummary() {
@@ -416,10 +652,7 @@ function dailySummary() {
         break;
       }
     }
-    const tierLower = tierRaw.toLowerCase();
-    let rate = 0;
-    if (tierLower.indexOf('$30') !== -1) rate = 30;
-    else if (tierLower.indexOf('$50') !== -1) rate = 50;
+    const rate = customerRate_(tierRaw);
 
     if (rate > 0) {
       paidCustomers.push(`  ${cust}: ${loadsForCust}× $${rate} = $${(loadsForCust * rate).toFixed(2)}`);
